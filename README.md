@@ -109,23 +109,6 @@ FocusLock/
 └── README.md
 ```
 
----
-
-## Roadmap
-
-Things I want to add when I have time:
-
-- [ ] Daily study goals
-- [ ] Multiple profiles (e.g. "Math mode", "Language mode")
-- [ ] Export stats to CSV
-- [ ] Sound alerts between phases
-- [ ] Discord Rich Presence ("Studying — do not disturb")
-- [ ] Calendar heatmap for stats
-
-PRs welcome if you want to help with any of these.
-
----
-
 ## License
 
 MIT — do whatever you want with it.
@@ -135,5 +118,5 @@ MIT — do whatever you want with it.
 <div align="center">
 Made by <a href="https://github.com/zadwen">zadwen</a> because exam season is brutal
 
-If it helped you focus, drop a ⭐ — it actually motivates me to keep working on it
+
 </div>
