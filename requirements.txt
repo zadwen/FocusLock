@@ -1,0 +1,5 @@
+# FocusLock — Python Requirements
+# All core features use the standard library.
+# Optional: build a .exe with PyInstaller
+
+pyinstaller>=6.0  # optional — for building FocusLock.exe
