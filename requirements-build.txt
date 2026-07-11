@@ -1,0 +1,12 @@
+# FocusLock v3.0.0 — Build Requirements
+# These are only needed for building the standalone executable.
+
+-r requirements.txt
+
+# Compiler and packager
+nuitka>=2.0
+ordered-set>=4.0
+zstandard>=0.15
+
+# For CI/CD: auto-downloads MinGW64 on Windows
+# mingw  # uncomment on CI if needed

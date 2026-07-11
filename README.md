@@ -1,12 +1,12 @@
 <div align="center">
 
-# 🔒 FocusLock
+# FocusLock
 
 ### Stop procrastinating. Start studying.
 
-A Windows app that kills distracting apps and locks you into study sessions.
+A Windows desktop app that blocks distracting apps and websites during Pomodoro focus sessions.
 
-[![Stars](https://img.shields.io/github/stars/zadwen/FocusLock?style=flat-square&color=6c63ff)](https://github.com/zadwen/FocusLock/stargazers)
+[![Stars](https://img.shields.io/github/stars/zadwen/FocusLock?style=flat-square&color=8b5cf6)](https://github.com/zadwen/FocusLock/stargazers)
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-0078d4?style=flat-square&logo=windows)](https://github.com/zadwen/FocusLock/releases)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-43e97b?style=flat-square)](LICENSE)
@@ -15,59 +15,180 @@ A Windows app that kills distracting apps and locks you into study sessions.
 
 ---
 
-Built this because I kept opening Steam every 10 minutes when I was supposed to be studying. Figured if I made it annoying enough to stop the session, I'd actually stay focused.
-
 ## Features
 
 | | |
 |---|---|
-| 🎮 **App Blocker** | Force-kills Steam, Discord, Epic Games, and anything else you add — every 2 seconds |
-| ⏱ **Pomodoro Timer** | Built-in timer with 4 presets. Switches automatically between focus and break |
-| ⏸ **Pause & Resume** | Pause the session (and blocking) if you need a real break |
-| 🌐 **Website Blocker** | Blocks sites via hosts file. Needs admin to work |
-| 🔐 **Password Lock** | Set a password so you can't just click "stop" when things get hard |
-| 👨‍👧 **Parent Password** | Second password that overrides the session one — useful if someone else is setting it for you |
-| 🚀 **Runs on Startup** | Opens with Windows so you don't forget to use it |
-| 🔔 **Break Notifications** | Windows notification when it's time to switch phases |
-| 🗕 **System Tray** | Minimizes to tray instead of closing |
-| 📊 **Study Stats** | Tracks sessions, total focus time, and your streak |
-| 🌙 **Dark / Light mode** | |
+| Pomodoro Timer | Circular countdown with work/break/long-break phases, 5 presets + custom durations |
+| Cycle Counter | Tracks "Pomodoro N of M" with configurable cycles before long break |
+| App Blocker | Force-kills distracting apps every 2 seconds during work phases |
+| Website Blocker | Blocks sites via hosts file modification (requires admin) |
+| Custom Durations | Set work/break/long-break/cycles via spinboxes on the session page |
+| Sound Alerts | Beep on phase change (toggle in Settings) |
+| Skip Button | Jump to the next phase without waiting |
+| Password Lock | Session password prevents pausing/stopping |
+| Parent Password | Second password that overrides session lock |
+| Auto-Start | Toggle whether phases auto-continue or pause between them |
+| Start with Windows | Registry startup entry |
+| System Tray | Minimizes to tray instead of closing |
+| Session Stats | Total sessions, focus time, streak, 7-day chart |
+| Dark / Light Theme | Toggle instantly without restarting |
 
 ---
 
-## Getting Started
+## Download
 
-### Download (easiest)
+Grab `FocusLock.exe` from the [Releases](https://github.com/zadwen/FocusLock/releases) page and run it. No Python needed.
 
-Grab `FocusLock.exe` from the [Releases](https://github.com/zadwen/FocusLock/releases) page and run it. No install needed.
+> Right-click > Run as Administrator if you want the website blocker to work.
 
-> Right-click → Run as Administrator if you want the website blocker to work.
+---
 
-### Run from source
+## Run from source
 
 ```bash
 git clone https://github.com/zadwen/FocusLock.git
 cd FocusLock
-python src/focuslock.py
+pip install -r requirements.txt
+python ./src/focuslock_app.py
 ```
 
-Needs Python 3.10+ on Windows. No pip installs required for the core app.
-
-**Optional — for system tray icon:**
-```bash
-pip install pystray Pillow
-```
+Requires Python 3.10+ on Windows.
 
 ---
 
-## How it works
+## Build a .exe
 
-1. Add the apps you want blocked in the **Blocklist** tab
-2. Pick a Pomodoro preset (or use Classic 25/5)
-3. Hit **Start Session** — blocked apps will be killed every 2 seconds
-4. Set a password in Settings if you don't trust yourself to stop early
+### Prerequisites
 
-The website blocker edits your `hosts` file to redirect blocked domains to localhost. It cleans up automatically when the session ends.
+| Requirement | Why | How to get it |
+|-------------|-----|---------------|
+| **Python 3.10+** | Runtime | [python.org](https://python.org) — check "Add to PATH" |
+| **Windows 10/11** | Platform | Required for hosts file + registry features |
+| **C compiler** | Nuitka compiles Python to machine code | Auto-downloaded (see below) |
+
+The C compiler is handled automatically. Nuitka downloads [MinGW64](https://winlibs.com) (~250 MB) on first build and caches it. No manual install needed.
+
+> If you prefer MSVC (Visual Studio Build Tools), install it from [here](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and Nuitka will use it instead.
+
+### Quick build (3 commands)
+
+```bash
+git clone https://github.com/zadwen/FocusLock.git
+cd FocusLock
+pip install -r requirements.txt
+pip install nuitka ordered-set zstandard
+python scripts/build.py --release
+python scripts/release.py --zip
+```
+
+This produces:
+
+```
+dist/
+├── FocusLock-3.0.0/          # Standalone folder (run FocusLock.exe from here)
+└── FocusLock-3.0.0.zip       # Zip for sharing (44 MB)
+```
+
+### Step-by-step build
+
+**1. Clone and install dependencies**
+
+```bash
+git clone https://github.com/zadwen/FocusLock.git
+cd FocusLock
+pip install -r requirements.txt        # PySide6, SQLAlchemy, psutil
+pip install nuitka ordered-set zstandard  # Build tools
+```
+
+**2. Build the executable**
+
+```bash
+python scripts/build.py --release
+```
+
+On first run, Nuitka will download MinGW64 (~250 MB). This is a one-time download, cached for future builds.
+
+Build takes **4-5 minutes** on a modern machine. Output goes to `build/nuitka_output/focuslock_app.dist/`.
+
+**3. Package for distribution**
+
+```bash
+python scripts/release.py --zip
+```
+
+This creates `dist/FocusLock-3.0.0/` with everything needed to run the app, plus a zip for sharing.
+
+**4. Test the build**
+
+```bash
+dist/FocusLock-3.0.0/FocusLock.exe
+```
+
+### Build modes
+
+```bash
+python scripts/build.py --release       # Optimized, LTO, version metadata (default)
+python scripts/build.py --development   # Faster build, minimal optimization
+python scripts/build.py --debug         # Debug symbols, no optimization
+```
+
+### Other scripts
+
+```bash
+python scripts/clean.py                 # Remove build artifacts
+python scripts/clean.py --all           # Also remove __pycache__
+python scripts/release.py --verify      # Check if build output exists
+python scripts/version.py               # Print current version (3.0.0)
+python scripts/version.py --bump patch  # 3.0.0 -> 3.0.1
+```
+
+### Create a Windows installer (optional)
+
+Requires [Inno Setup 6.x](https://jrsoftware.org/isinfo.php):
+
+```bash
+python scripts/build.py --release
+python scripts/release.py
+iscc installer/focuslock.iss
+```
+
+Output: `dist/FocusLock-3.0.0-Setup.exe`
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `No C compiler detected` | Nuitka will auto-download MinGW64. Wait for the download (~250 MB). |
+| Build hangs at download | Your connection may be slow. The download is cached — rerun `build.py` to resume. |
+| `gcc.exe` not found after download | Delete `build/` and rerun. Nuitka will re-extract. |
+| `PySide6` errors | Run `pip install --upgrade PySide6` and rebuild. |
+| `ModuleNotFoundError` | Run `pip install -r requirements.txt` |
+| Website blocker doesn't work | Run the app as Administrator (hosts file requires admin). |
+| Antivirus blocks the exe | Add an exclusion for `dist/FocusLock-3.0.0/`. Nuitka builds occasionally trigger false positives. |
+
+### What the build produces
+
+```
+dist/FocusLock-3.0.0/
+├── FocusLock.exe          # The app (52 MB)
+├── python312.dll          # Python runtime
+├── qt6core.dll            # Qt framework
+├── qt6gui.dll
+├── qt6widgets.dll
+├── PySide6/               # Qt plugins + translations
+├── shiboken6/             # PySide6 bindings
+├── sqlalchemy/            # ORM
+├── psutil/                # Process management
+├── *.dll, *.pyd           # C extensions
+├── Install.bat            # Creates Desktop shortcut
+├── Uninstall.bat          # Removes shortcut
+├── README.txt             # End-user instructions
+├── LICENSE
+└── CHANGELOG.md
+```
+
+No Python installation needed on the target machine. Just zip and share.
 
 ---
 
@@ -84,39 +205,52 @@ Fully editable from the UI.
 
 ---
 
-## Build a .exe yourself
-
-```bash
-pip install pyinstaller
-build.bat
-```
-
-Output goes to `dist/FocusLock.exe`.
-
----
-
-## Project layout
+## Project Layout
 
 ```
 FocusLock/
 ├── src/
-│   └── focuslock.py        # everything's in here
-├── assets/
-├── .github/workflows/
-│   └── build.yml           # auto-builds exe on release tags
-├── build.bat
-├── requirements.txt
-└── README.md
+│   ├── focuslock_app.py              # Main entry point
+│   └── focuslock/                    # Core package
+│       ├── constants.py              # Name, version, themes, presets
+│       ├── config.py                 # SQLAlchemy ORM (SQLite)
+│       ├── core/
+│       │   ├── timer.py              # Thread-safe PomodoroTimer
+│       │   └── security.py           # Password hashing
+│       ├── blocking/
+│       │   ├── app_blocker.py        # Process blocking
+│       │   └── website_blocker.py    # Hosts file blocking
+│       ├── platform/
+│       │   ├── startup.py            # Windows registry
+│       │   ├── notifications.py      # Toast notifications
+│       │   └── subprocess_patch.py   # Hidden console windows
+│       └── ui/
+│           ├── widgets.py            # Theme, CircularTimer, charts
+│           └── dialogs.py            # App/site picker dialogs
+├── scripts/
+│   ├── version.py                    # Single source of truth for version
+│   ├── build.py                      # Nuitka build orchestrator
+│   ├── clean.py                      # Build artifact cleanup
+│   └── release.py                    # Release packaging
+├── installer/
+│   └── focuslock.iss                 # Inno Setup installer script
+├── .github/workflows/build.yml        # GitHub Actions CI/CD
+├── requirements.txt                  # Python dependencies
+├── docs/
+│   ├── BUILD.md                      # Technical build docs
+│   ├── REFERENCE.md                  # Technical reference
+│   └── CHANGELOG.md                  # Version history
+└── LICENSE                           # MIT
 ```
+
+---
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
 
 ---
 
 <div align="center">
-Made by <a href="https://github.com/zadwen">zadwen</a> because exam season is brutal
-
-
+Made by <a href="https://github.com/zadwen">zadwen</a>
 </div>

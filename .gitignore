@@ -1,8 +1,30 @@
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-dist/
-build/
-*.spec
-.env
 *.egg-info/
+
+# Virtual environment
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Type checking
+.mypy_cache/
+.pytest_cache/
+
+# Database (user data, not source)
+*.db
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

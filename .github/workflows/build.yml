@@ -1,0 +1,64 @@
+name: Build FocusLock
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Nuitka and compilers
+        run: |
+          pip install nuitka ordered-set zstandard
+          pip install mingw
+
+      - name: Read version
+        id: version
+        run: python -c "from scripts.version import VERSION; print(f'version={VERSION}')" >> $env:GITHUB_OUTPUT
+
+      - name: Build with Nuitka
+        run: python scripts/build.py --release
+
+      - name: Package release
+        run: python scripts/release.py --zip
+
+      - name: Upload release folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: FocusLock-${{ steps.version.outputs.version }}-Windows
+          path: dist/FocusLock-${{ steps.version.outputs.version }}/
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: FocusLock-${{ steps.version.outputs.version }}-zip
+          path: dist/FocusLock-${{ steps.version.outputs.version }}.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/FocusLock-${{ steps.version.outputs.version }}.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
