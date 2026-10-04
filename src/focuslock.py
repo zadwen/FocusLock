@@ -1,827 +1,569 @@
-"""
-FocusLock v1.2.0
-by zadwen — github.com/zadwen/FocusLock
-"""
+"""FocusLock — a calm, local-first focus timer for Windows and Linux."""
+from __future__ import annotations
 
-import sys, os, json, time, threading, hashlib, datetime, ctypes, winreg
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+import argparse
+import datetime as dt
+import os
 from pathlib import Path
+import queue
+import sys
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
 
-# ── completely suppress CMD windows for ALL subprocesses ──────────────────────
-# We patch subprocess at import time so nothing can ever flash a window
-import subprocess as _subprocess
+from core import (VERSION, IS_WINDOWS, DEFAULT_APPS, PRESETS, HostsManager, Session,
+                  atomic_json, data_dir, hash_password, load_config, load_stats,
+                  normalize_domain, record_session, streaks, validate_app, verify_password)
+from platform_support import AppBlocker, InstanceLock, notify, set_startup, startup_enabled
 
-_ORIG_POPEN = _subprocess.Popen
-_NW = 0x08000000  # CREATE_NO_WINDOW flag
-
-class _PatchedPopen(_ORIG_POPEN):
-    def __init__(self, *a, **kw):
-        kw.setdefault("creationflags", 0)
-        kw["creationflags"] |= _NW
-        kw.setdefault("stdout", _subprocess.DEVNULL)
-        kw.setdefault("stderr", _subprocess.DEVNULL)
-        super().__init__(*a, **kw)
-
-_subprocess.Popen = _PatchedPopen
-import subprocess  # re-import so the rest of file uses patched version
-
-# ── also hide own console window immediately ───────────────────────────────────
-try:
-    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-except Exception:
-    pass
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-APP_NAME = "FocusLock"
-VERSION  = "1.2.0"
-
-DATA_DIR    = Path(os.getenv("APPDATA", ".")) / "FocusLock"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-CONFIG_FILE = DATA_DIR / "config.json"
-STATS_FILE  = DATA_DIR / "stats.json"
-
-DEFAULT_APPS = [
-    "steam.exe", "steamwebhelper.exe", "discord.exe",
-    "EpicGamesLauncher.exe", "Battle.net.exe",
-    "LeagueClient.exe", "TwitchUI.exe", "Spotify.exe",
-]
-
-DEFAULT_SITES = [
-    "youtube.com", "twitter.com", "reddit.com",
-    "twitch.tv", "instagram.com", "tiktok.com", "facebook.com",
-]
-
-PRESETS = {
-    "Classic (25/5)":     (25, 5),
-    "Long Focus (50/10)": (50, 10),
-    "Short Burst (15/3)": (15, 3),
-    "Deep Work (90/20)":  (90, 20),
+PALETTES = {
+    "dark": {"bg": "#0d1519", "surface": "#142027", "card": "#1b2c34", "text": "#edf5f2",
+             "muted": "#a0b7ba", "accent": "#b9f277", "ink": "#142018", "line": "#30434a", "danger": "#ffaaa0"},
+    "light": {"bg": "#f2f5ef", "surface": "#ffffff", "card": "#e5ecdf", "text": "#182c25",
+              "muted": "#50665c", "accent": "#315f24", "ink": "#ffffff", "line": "#ccd8c6", "danger": "#a7302b"},
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config / Stats
-# ─────────────────────────────────────────────────────────────────────────────
-def load_config():
-    d = {
-        "blocklist": DEFAULT_APPS[:],
-        "website_blocklist": DEFAULT_SITES[:],
-        "password_hash": "",
-        "parent_password_hash": "",
-        "block_websites": False,
-        "pomodoro_work": 25,
-        "pomodoro_break": 5,
-        "theme": "dark",
-        "run_on_startup": False,
-        "minimize_to_tray": True,
-        "notify_break": True,
-        "session_name": "",
-    }
-    if CONFIG_FILE.exists():
-        try:
-            d.update(json.loads(CONFIG_FILE.read_text()))
-        except Exception:
-            pass
-    return d
 
-def save_config(c): CONFIG_FILE.write_text(json.dumps(c, indent=2))
-
-def load_stats():
-    d = {"total_sessions":0,"total_minutes":0,"sessions_by_date":{},
-         "current_streak":0,"longest_streak":0,"last_session_date":""}
-    if STATS_FILE.exists():
-        try: d.update(json.loads(STATS_FILE.read_text()))
-        except Exception: pass
-    return d
-
-def save_stats(s): STATS_FILE.write_text(json.dumps(s, indent=2))
-def hash_pw(pw):   return hashlib.sha256(pw.encode()).hexdigest()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Windows startup registry
-# ─────────────────────────────────────────────────────────────────────────────
-REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-def set_startup(enable):
-    try:
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_SET_VALUE)
-        if enable:
-            path = sys.executable if getattr(sys,"frozen",False) else f'pythonw "{os.path.abspath(__file__)}"'
-            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, path)
-        else:
-            try: winreg.DeleteValue(k, APP_NAME)
-            except FileNotFoundError: pass
-        winreg.CloseKey(k)
-        return True
-    except Exception as e:
-        print("registry error:", e)
-        return False
-
-def startup_is_on():
-    try:
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_READ)
-        winreg.QueryValueEx(k, APP_NAME)
-        winreg.CloseKey(k)
-        return True
-    except Exception:
-        return False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# App Blocker  (no CMD window — patched Popen above handles it)
-# ─────────────────────────────────────────────────────────────────────────────
-class AppBlocker:
-    def __init__(self, blocklist):
-        self.blocklist = [b.lower() for b in blocklist]
-        self._on = False
-
-    def start(self):
-        self._on = True
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def stop(self): self._on = False
-
-    def _loop(self):
-        while self._on:
-            self._kill()
-            time.sleep(2)
-
-    def _kill(self):
-        try:
-            r = subprocess.run(
-                ["tasklist", "/fo", "csv", "/nh"],
-                capture_output=True, text=True, timeout=5
-            )
-            for line in r.stdout.splitlines():
-                parts = line.strip().strip('"').split('","')
-                if len(parts) < 2: continue
-                if parts[0].lower() in self.blocklist:
-                    subprocess.run(["taskkill", "/F", "/PID", parts[1]], capture_output=True)
-        except Exception:
-            pass
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Website Blocker
-# ─────────────────────────────────────────────────────────────────────────────
-HOSTS = Path(r"C:\Windows\System32\drivers\etc\hosts")
-FL_START = "# FocusLock-START"
-FL_END   = "# FocusLock-END"
-
-def _strip(content):
-    out, inside = [], False
-    for ln in content.splitlines():
-        if FL_START in ln: inside = True; continue
-        if FL_END   in ln: inside = False; continue
-        if not inside: out.append(ln)
-    return "\n".join(out)
-
-def block_sites(domains):
-    try:
-        c = _strip(HOSTS.read_text(encoding="utf-8"))
-        block = f"\n{FL_START}\n" + "".join(f"127.0.0.1 {d}\n127.0.0.1 www.{d}\n" for d in domains) + f"{FL_END}\n"
-        HOSTS.write_text(c + block, encoding="utf-8")
-        return True
-    except PermissionError: return False
-
-def unblock_sites():
-    try:
-        HOSTS.write_text(_strip(HOSTS.read_text(encoding="utf-8")), encoding="utf-8")
-    except Exception: pass
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pomodoro Timer
-# ─────────────────────────────────────────────────────────────────────────────
-class PomodoroTimer:
-    def __init__(self, work_min, break_min, on_tick=None, on_phase=None):
-        self.work_sec  = work_min * 60
-        self.break_sec = break_min * 60
-        self.on_tick   = on_tick
-        self.on_phase  = on_phase
-        self._rem   = self.work_sec
-        self._phase = "work"
-        self._on    = False
-        self.cycles = 0
-
-    @property
-    def phase(self):     return self._phase
-    @property
-    def remaining(self): return self._rem
-
-    def start(self):
-        if self._on: return
-        self._on = True
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def pause(self): self._on = False
-
-    def reset(self):
-        self._on = False
-        self._phase = "work"
-        self._rem   = self.work_sec
-        self.cycles = 0
-        if self.on_tick: self.on_tick(self._rem, self._phase)
-
-    def _loop(self):
-        while self._on and self._rem > 0:
-            time.sleep(1)
-            if not self._on: return
-            self._rem -= 1
-            if self.on_tick: self.on_tick(self._rem, self._phase)
-        if self._on and self._rem <= 0:
-            self._switch()
-
-    def _switch(self):
-        if self._phase == "work":
-            self.cycles += 1; self._phase = "break"; self._rem = self.break_sec
-        else:
-            self._phase = "work"; self._rem = self.work_sec
-        if self.on_phase: self.on_phase(self._phase, self.cycles)
-        threading.Thread(target=self._loop, daemon=True).start()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Windows notification (no CMD flash — uses patched Popen)
-# ─────────────────────────────────────────────────────────────────────────────
-def notify(title, msg):
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "$n=New-Object System.Windows.Forms.NotifyIcon;"
-        "$n.Icon=[System.Drawing.SystemIcons]::Information;"
-        "$n.Visible=$true;"
-        f"$n.ShowBalloonTip(4000,'{title}','{msg}',[System.Windows.Forms.ToolTipIcon]::None);"
-        "Start-Sleep -s 5;$n.Dispose()"
-    )
-    try:
-        subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", script])
-    except Exception:
-        pass
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Colors
-# ─────────────────────────────────────────────────────────────────────────────
-DARK = {"bg":"#0f0f13","surface":"#1a1a24","card":"#22223a","accent":"#6c63ff",
-        "accent2":"#ff6584","success":"#43e97b","warn":"#f9c74f",
-        "text":"#e8e8f0","subtext":"#8888aa","border":"#2e2e4a"}
-
-LIGHT = {"bg":"#f4f4fb","surface":"#ffffff","card":"#eaeaf6","accent":"#6c63ff",
-         "accent2":"#ff6584","success":"#2cb67d","warn":"#e09f00",
-         "text":"#1a1a2e","subtext":"#555577","border":"#d0d0e8"}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main App
-# ─────────────────────────────────────────────────────────────────────────────
 class FocusLock(tk.Tk):
-    def __init__(self):
+    def __init__(self, directory=None):
         super().__init__()
-        self.cfg   = load_config()
-        self.stats = load_stats()
-        self.C     = DARK if self.cfg["theme"] == "dark" else LIGHT
+        self.directory = Path(directory) if directory else data_dir()
+        self.cfg, config_warning = load_config(self.directory / "config.json")
+        self.stats, stats_warning = load_stats(self.directory / "stats.json")
+        self.session = None
+        self.hosts = HostsManager()
+        self.blocker = AppBlocker()
+        self.current_page = "Focus"
+        self.status_text = "Your next good hour starts here."
+        self.site_error = False
+        self._closing = False
+        self.title("FocusLock")
+        self.geometry("1040x760")
+        self.minsize(940, 710)
+        self.protocol("WM_DELETE_WINDOW", self.close_window)
+        self._build()
+        self.after(200, self._pulse)
+        warnings = [w for w in (config_warning, stats_warning) if w]
+        if warnings:
+            self.after(400, lambda: messagebox.showwarning("Recovered settings", "\n\n".join(warnings), parent=self))
+        self.after(600, self._recover_hosts)
 
-        self._blocker      = None
-        self._timer        = None
-        self._session_start= None
-        self._locked       = False
-        self._paused       = False
-        self._mini_win     = None   # the floating "restore" mini window
+    @property
+    def active(self):
+        return bool(self.session and self.session.running)
 
-        self.title(f"FocusLock v{VERSION}")
-        self.geometry("820x640")
-        self.resizable(False, False)
-        self.configure(bg=self.C["bg"])
+    def persist(self, stats=False):
+        try:
+            atomic_json(self.directory / ("stats.json" if stats else "config.json"), self.stats if stats else self.cfg)
+            return True
+        except OSError as exc:
+            messagebox.showerror("Could not save", f"{exc}\nYour changes are still in memory.", parent=self)
+            return False
 
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+    def text(self, parent, text, size=11, color="text", bold=False, bg=None, **kwargs):
+        return tk.Label(parent, text=text, font=(self.font, size, "bold" if bold else "normal"),
+                        bg=bg or parent.cget("bg"), fg=self.C[color], **kwargs)
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-    def _build_ui(self):
+    def button(self, parent, text, command, primary=False, danger=False, **kwargs):
+        return tk.Button(parent, text=text, command=command, font=(self.font, 10, "bold"),
+                         bg=self.C["accent"] if primary else self.C["card"],
+                         fg=self.C["ink"] if primary else self.C["danger" if danger else "text"],
+                         activebackground=self.C["accent"], activeforeground=self.C["ink"],
+                         relief="flat", bd=0, padx=16, pady=10, cursor="hand2",
+                         highlightthickness=1, highlightbackground=self.C["line"], **kwargs)
+
+    def entry(self, parent, var, width=24):
+        return tk.Entry(parent, textvariable=var, width=width, relief="flat", bd=0,
+                        font=(self.font, 12), bg=self.C["card"], fg=self.C["text"],
+                        insertbackground=self.C["text"], highlightthickness=1,
+                        highlightbackground=self.C["line"], highlightcolor=self.C["accent"])
+
+    def _build(self):
+        for child in self.winfo_children():
+            child.destroy()
+        self.C = PALETTES[self.cfg["theme"]]
+        self.font = "Segoe UI" if IS_WINDOWS else "DejaVu Sans"
         C = self.C
+        self.configure(bg=C["bg"])
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Focus.Horizontal.TProgressbar", background=C["accent"], troughcolor=C["line"],
+                        borderwidth=0, lightcolor=C["accent"], darkcolor=C["accent"])
+        side = tk.Frame(self, bg=C["surface"], width=195)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        self.text(side, "FOCUSLOCK", 17, "accent", True).pack(anchor="w", padx=20, pady=(32, 3))
+        self.text(side, "Make room for deep work.", 9, "muted").pack(anchor="w", padx=20, pady=(0, 38))
+        self.nav = {}
+        for name in ("Focus", "Blocked apps", "Websites", "Insights", "Settings"):
+            b = self.button(side, name, lambda n=name: self.show_page(n), anchor="w")
+            b.pack(fill="x", padx=12, pady=4)
+            self.nav[name] = b
+        self.button(side, "Quit FocusLock", self.quit_app).pack(side="bottom", fill="x", padx=12, pady=14)
+        self.text(side, f"LOCAL FIRST  /  v{VERSION}\nby zadwen", 9, "muted", justify="left").pack(side="bottom", anchor="w", padx=20, pady=10)
+        outer = tk.Frame(self, bg=C["bg"])
+        outer.pack(side="left", fill="both", expand=True, padx=30, pady=25)
+        head = tk.Frame(outer, bg=C["bg"])
+        head.pack(fill="x", pady=(0, 20))
+        self.page_title = self.text(head, "", 25, bold=True)
+        self.page_title.pack(side="left")
+        self.state_badge = self.text(head, "READY", 9, "accent", True, padx=12, pady=7, bg=C["card"])
+        self.state_badge.pack(side="right")
+        self.container = tk.Frame(outer, bg=C["bg"])
+        self.container.pack(fill="both", expand=True)
+        self.pages = {}
+        for name in self.nav:
+            self.pages[name] = tk.Frame(self.container, bg=C["bg"])
+        self._focus_page()
+        self._list_page("Blocked apps", "blocklist")
+        self._list_page("Websites", "website_blocklist")
+        self._insights_page()
+        self._settings_page()
+        self.status_label = self.text(outer, self.status_text, 9, "muted", anchor="w", justify="left", wraplength=680)
+        self.status_label.pack(fill="x", pady=(12, 0))
+        self.show_page(self.current_page)
+        self._render_timer()
 
-        hdr = tk.Frame(self, bg=C["surface"], height=60)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="🔒 FocusLock", font=("Segoe UI",17,"bold"),
-                 bg=C["surface"], fg=C["accent"]).pack(side="left", padx=20, pady=14)
-        tk.Label(hdr, text=f"v{VERSION}", font=("Segoe UI",9),
-                 bg=C["surface"], fg=C["subtext"]).pack(side="left", pady=14)
-        tk.Button(hdr, text="☀" if self.cfg["theme"]=="dark" else "🌙",
-                  command=self._toggle_theme, relief="flat",
-                  bg=C["surface"], fg=C["subtext"], font=("Segoe UI",14),
-                  cursor="hand2", bd=0).pack(side="right", padx=16)
+    def show_page(self, name):
+        for page in self.pages.values():
+            page.pack_forget()
+        self.pages[name].pack(fill="both", expand=True)
+        self.current_page = name
+        self.page_title.configure(text={"Focus": "Less noise. More focus.", "Insights": "Your effort adds up."}.get(name, name))
+        for n, button in self.nav.items():
+            button.configure(bg=self.C["card"] if n == name else self.C["surface"],
+                             fg=self.C["accent"] if n == name else self.C["muted"])
+        if name == "Insights":
+            self._refresh_stats()
 
-        tab_bar = tk.Frame(self, bg=C["surface"])
-        tab_bar.pack(fill="x")
-        self._pages    = {}
-        self._tab_btns = {}
-        self._cur_tab  = "Session"
+    def _focus_page(self):
+        p, C = self.pages["Focus"], self.C
+        self.text(p, "One task. One timer. A little space to do your best work.", 11, "muted").pack(anchor="w", pady=(0, 18))
+        self.name_var = tk.StringVar(value=self.cfg["session_name"])
+        self.text(p, "WHAT ARE YOU WORKING ON?", 9, "muted", True).pack(anchor="w", pady=(0, 6))
+        self.name_entry = self.entry(p, self.name_var)
+        self.name_entry.pack(fill="x", ipady=9, pady=(0, 16))
+        card = tk.Frame(p, bg=C["surface"], highlightthickness=1, highlightbackground=C["line"])
+        card.pack(fill="x")
+        self.phase_label = self.text(card, "FOCUS TIME", 10, "accent", True)
+        self.phase_label.pack(pady=(18, 0))
+        self.timer_label = self.text(card, "25:00", 66, bold=True)
+        self.timer_label.pack()
+        self.cycle_label = self.text(card, "No rush. Just begin.", 10, "muted")
+        self.cycle_label.pack(pady=(0, 13))
+        self.progress = ttk.Progressbar(card, style="Focus.Horizontal.TProgressbar", maximum=100)
+        self.progress.pack(fill="x", padx=30, pady=(0, 16))
+        actions = tk.Frame(card, bg=C["surface"])
+        actions.pack(pady=(0, 20))
+        self.start_button = self.button(actions, "Start focus", self.toggle_session, primary=True, width=16)
+        self.start_button.pack(side="left", padx=5)
+        self.pause_button = self.button(actions, "Pause", self.pause_resume, width=9)
+        self.pause_button.pack(side="left", padx=5)
+        plan = tk.Frame(p, bg=C["bg"])
+        plan.pack(fill="x", pady=(18, 8))
+        self.text(plan, "YOUR RHYTHM", 9, "muted", True).pack(anchor="w", pady=(0, 8))
+        presets = tk.Frame(plan, bg=C["bg"])
+        presets.pack(fill="x")
+        self.preset_buttons = []
+        for i, (name, times) in enumerate(PRESETS.items()):
+            presets.columnconfigure(i, weight=1)
+            b = self.button(presets, f"{name}\n{times[0]} / {times[1]} min", lambda t=times: self.choose_preset(t))
+            b.grid(row=0, column=i, sticky="ew", padx=(0, 5))
+            self.preset_buttons.append(b)
+        custom = tk.Frame(plan, bg=C["bg"])
+        custom.pack(fill="x", pady=(12, 0))
+        self.work_var = tk.StringVar(value=str(self.cfg["pomodoro_work"]))
+        self.break_var = tk.StringVar(value=str(self.cfg["pomodoro_break"]))
+        for label, variable in (("Focus", self.work_var), ("Break", self.break_var)):
+            self.text(custom, label, 10, "muted").pack(side="left", padx=(0, 8))
+            self.entry(custom, variable, 4).pack(side="left", ipady=5, padx=(0, 8))
+        self.text(custom, "minutes · 1–240 each", 9, "muted").pack(side="left")
+        self.apply_button = self.button(custom, "Apply", self.apply_custom)
+        self.apply_button.pack(side="right")
+        self.block_summary = self.text(p, "", 10, "muted")
+        self.block_summary.pack(anchor="w", pady=(13, 0))
 
-        for tab in ["Session","Blocklist","Websites","Stats","Settings"]:
-            b = tk.Button(tab_bar, text=tab, relief="flat",
-                          bg=C["surface"], fg=C["subtext"],
-                          font=("Segoe UI",10), padx=16, pady=10,
-                          command=lambda t=tab: self._switch_tab(t),
-                          cursor="hand2", bd=0)
-            b.pack(side="left")
-            self._tab_btns[tab] = b
-
-        self._content = tk.Frame(self, bg=C["bg"])
-        self._content.pack(fill="both", expand=True, padx=20, pady=16)
-
-        self._build_session()
-        self._build_blocklist()
-        self._build_websites()
-        self._build_stats()
-        self._build_settings()
-        self._switch_tab("Session")
-
-    def _switch_tab(self, name):
-        C = self.C
-        for n,p in self._pages.items(): p.pack_forget()
-        for n,b in self._tab_btns.items():
-            b.configure(fg=C["accent"] if n==name else C["subtext"],
-                        font=("Segoe UI",10,"bold" if n==name else "normal"))
-        self._pages[name].pack(fill="both", expand=True)
-        self._cur_tab = name
-
-    # ── toggle widget (replaces broken Checkbutton on Windows) ───────────────
-    def _toggle(self, parent, var, callback):
-        C = self.C
-        def refresh():
-            on = var.get()
-            btn.configure(text=" ON " if on else " OFF",
-                          bg=C["accent"] if on else C["border"],
-                          fg="white" if on else C["subtext"])
-        def click():
-            var.set(not var.get()); refresh(); callback()
-        btn = tk.Button(parent, text="", command=click, relief="flat",
-                        font=("Segoe UI",8,"bold"), padx=8, pady=4,
-                        cursor="hand2", bd=0, width=5)
-        refresh()
-        return btn
-
-    # ── Session tab ───────────────────────────────────────────────────────────
-    def _build_session(self):
-        C = self.C
-        f = tk.Frame(self._content, bg=C["bg"])
-        self._pages["Session"] = f
-
-        nr = tk.Frame(f, bg=C["bg"]); nr.pack(fill="x", pady=(0,8))
-        tk.Label(nr, text="Session name (optional):", bg=C["bg"], fg=C["subtext"],
-                 font=("Segoe UI",9)).pack(side="left")
-        self._sname = tk.StringVar(value=self.cfg.get("session_name",""))
-        tk.Entry(nr, textvariable=self._sname, bg=C["card"], fg=C["text"],
-                 insertbackground=C["text"], relief="flat",
-                 font=("Segoe UI",10), width=30).pack(side="left", padx=8)
-
-        card = tk.Frame(f, bg=C["card"]); card.pack(fill="x", pady=(0,10))
-
-        self._phase_lbl = tk.Label(card, text="FOCUS TIME", font=("Segoe UI",11,"bold"),
-                                   bg=C["card"], fg=C["accent"])
-        self._phase_lbl.pack(pady=(16,2))
-        self._timer_lbl = tk.Label(card, text="25:00", font=("Courier New",54,"bold"),
-                                   bg=C["card"], fg=C["text"])
-        self._timer_lbl.pack()
-        self._cycle_lbl = tk.Label(card, text="No cycles yet", font=("Segoe UI",9),
-                                   bg=C["card"], fg=C["subtext"])
-        self._cycle_lbl.pack(pady=(0,8))
-        self._progress = ttk.Progressbar(card, length=420, mode="determinate")
-        self._progress.pack(pady=(0,14))
-
-        br = tk.Frame(card, bg=C["card"]); br.pack(pady=(0,16))
-        self._start_btn = tk.Button(br, text="🔒  START SESSION",
-                                    command=self._toggle_session,
-                                    bg=C["accent"], fg="white",
-                                    font=("Segoe UI",12,"bold"),
-                                    relief="flat", padx=22, pady=9,
-                                    cursor="hand2", bd=0)
-        self._start_btn.pack(side="left", padx=4)
-        self._pause_btn = tk.Button(br, text="⏸ Pause", command=self._pause_resume,
-                                    bg=C["card"], fg=C["subtext"], font=("Segoe UI",10),
-                                    relief="flat", padx=12, pady=9,
-                                    cursor="hand2", bd=0, state="disabled")
-        self._pause_btn.pack(side="left", padx=4)
-        tk.Button(br, text="↺ Reset", command=self._reset_timer,
-                  bg=C["card"], fg=C["subtext"], font=("Segoe UI",10),
-                  relief="flat", padx=12, pady=9, cursor="hand2", bd=0).pack(side="left", padx=4)
-
-        pr = tk.Frame(f, bg=C["bg"]); pr.pack(fill="x", pady=2)
-        tk.Label(pr, text="Preset:", bg=C["bg"], fg=C["subtext"],
-                 font=("Segoe UI",9)).pack(side="left")
-        self._preset = tk.StringVar(value="Classic (25/5)")
-        for lbl in PRESETS:
-            tk.Radiobutton(pr, text=lbl, variable=self._preset, value=lbl,
-                           command=self._apply_preset, bg=C["bg"], fg=C["text"],
-                           selectcolor=C["card"], activebackground=C["bg"],
-                           font=("Segoe UI",9), cursor="hand2").pack(side="left", padx=6)
-
-        self._status = tk.Label(f, text="Ready. Pick a preset and start your session.",
-                                bg=C["bg"], fg=C["subtext"], font=("Segoe UI",9))
-        self._status.pack(pady=6)
-
-    # ── Blocklist tab ─────────────────────────────────────────────────────────
-    def _build_blocklist(self):
-        C = self.C
-        f = tk.Frame(self._content, bg=C["bg"])
-        self._pages["Blocklist"] = f
-        tk.Label(f, text="App Blocklist", font=("Segoe UI",13,"bold"),
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(0,2))
-        tk.Label(f, text="These processes are force-killed every 2 seconds during a session.",
-                 bg=C["bg"], fg=C["subtext"], font=("Segoe UI",9)).pack(anchor="w", pady=(0,8))
-        lf = tk.Frame(f, bg=C["card"]); lf.pack(fill="both", expand=True)
-        sb = tk.Scrollbar(lf); sb.pack(side="right", fill="y")
-        self._app_lb = tk.Listbox(lf, yscrollcommand=sb.set, bg=C["card"], fg=C["text"],
-                                  selectbackground=C["accent"], font=("Consolas",10),
-                                  relief="flat", bd=0, highlightthickness=0)
-        self._app_lb.pack(fill="both", expand=True, padx=8, pady=8)
-        sb.config(command=self._app_lb.yview)
-        for a in self.cfg["blocklist"]: self._app_lb.insert(tk.END, a)
-        br = tk.Frame(f, bg=C["bg"]); br.pack(fill="x", pady=6)
-        tk.Button(br, text="+ Add App", command=self._add_app,
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",9,"bold"), padx=12, pady=5,
-                  cursor="hand2", bd=0).pack(side="left", padx=(0,6))
-        tk.Button(br, text="✕ Remove", command=self._remove_app,
-                  bg=C["card"], fg=C["accent2"], relief="flat",
-                  font=("Segoe UI",9), padx=12, pady=5,
-                  cursor="hand2", bd=0).pack(side="left")
-        tk.Button(br, text="↺ Defaults", command=self._reset_app_defaults,
-                  bg=C["card"], fg=C["subtext"], relief="flat",
-                  font=("Segoe UI",9), padx=12, pady=5,
-                  cursor="hand2", bd=0).pack(side="right")
-
-    # ── Websites tab ──────────────────────────────────────────────────────────
-    def _build_websites(self):
-        C = self.C
-        f = tk.Frame(self._content, bg=C["bg"])
-        self._pages["Websites"] = f
-        tk.Label(f, text="Website Blocker", font=("Segoe UI",13,"bold"),
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(0,2))
-        tk.Label(f, text="⚠  Requires Administrator — right-click → Run as Administrator.",
-                 bg=C["bg"], fg=C["warn"], font=("Segoe UI",9)).pack(anchor="w", pady=(0,8))
-
-        self._web_var = tk.BooleanVar(value=self.cfg.get("block_websites", False))
-        wr = tk.Frame(f, bg=C["bg"]); wr.pack(anchor="w", pady=(0,8))
-        tk.Label(wr, text="Block websites during sessions",
-                 bg=C["bg"], fg=C["text"], font=("Segoe UI",10)).pack(side="left")
-        self._toggle(wr, self._web_var, self._save_cfg).pack(side="left", padx=10)
-
-        lf = tk.Frame(f, bg=C["card"]); lf.pack(fill="both", expand=True)
-        sb = tk.Scrollbar(lf); sb.pack(side="right", fill="y")
-        self._web_lb = tk.Listbox(lf, yscrollcommand=sb.set, bg=C["card"], fg=C["text"],
-                                  selectbackground=C["accent"], font=("Consolas",10),
-                                  relief="flat", bd=0, highlightthickness=0)
-        self._web_lb.pack(fill="both", expand=True, padx=8, pady=8)
-        sb.config(command=self._web_lb.yview)
-        for s in self.cfg["website_blocklist"]: self._web_lb.insert(tk.END, s)
-        br = tk.Frame(f, bg=C["bg"]); br.pack(fill="x", pady=6)
-        tk.Button(br, text="+ Add Site", command=self._add_site,
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",9,"bold"), padx=12, pady=5,
-                  cursor="hand2", bd=0).pack(side="left", padx=(0,6))
-        tk.Button(br, text="✕ Remove", command=self._remove_site,
-                  bg=C["card"], fg=C["accent2"], relief="flat",
-                  font=("Segoe UI",9), padx=12, pady=5,
-                  cursor="hand2", bd=0).pack(side="left")
-
-    # ── Stats tab ─────────────────────────────────────────────────────────────
-    def _build_stats(self):
-        C = self.C
-        f = tk.Frame(self._content, bg=C["bg"])
-        self._pages["Stats"] = f
-        tk.Label(f, text="Study Stats", font=("Segoe UI",13,"bold"),
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(0,12))
-        s = self.stats
-        h, m = s["total_minutes"]//60, s["total_minutes"]%60
-        for icon, label, val in [
-            ("📅","Total Sessions", str(s["total_sessions"])),
-            ("⏱","Total Focus Time", f"{h}h {m}m"),
-            ("🔥","Current Streak", f"{s['current_streak']} days"),
-            ("🏆","Longest Streak", f"{s['longest_streak']} days"),
-        ]:
-            row = tk.Frame(f, bg=C["card"]); row.pack(fill="x", pady=3)
-            tk.Label(row, text=icon, font=("Segoe UI",16), bg=C["card"]).pack(side="left", padx=12, pady=10)
-            tk.Label(row, text=label, font=("Segoe UI",10), bg=C["card"], fg=C["subtext"]).pack(side="left")
-            tk.Label(row, text=val, font=("Segoe UI",12,"bold"), bg=C["card"], fg=C["accent"]).pack(side="right", padx=16)
-        if s.get("last_session_date"):
-            tk.Label(f, text=f"Last session: {s['last_session_date']}",
-                     bg=C["bg"], fg=C["subtext"], font=("Segoe UI",9)).pack(anchor="w", pady=8)
-        tk.Button(f, text="Reset all stats", command=self._reset_stats,
-                  bg=C["card"], fg=C["accent2"], relief="flat",
-                  font=("Segoe UI",9), pady=5, cursor="hand2", bd=0).pack(anchor="e", pady=10)
-
-    # ── Settings tab ──────────────────────────────────────────────────────────
-    def _build_settings(self):
-        C = self.C
-        f = tk.Frame(self._content, bg=C["bg"])
-        self._pages["Settings"] = f
-        tk.Label(f, text="Settings", font=("Segoe UI",13,"bold"),
-                 bg=C["bg"], fg=C["text"]).pack(anchor="w", pady=(0,12))
-
-        def row(parent, icon_text):
-            r = tk.Frame(parent, bg=C["card"]); r.pack(fill="x", pady=3)
-            tk.Label(r, text=icon_text, bg=C["card"], fg=C["text"],
-                     font=("Segoe UI",10)).pack(side="left", padx=12, pady=12)
-            return r
-
-        # Launch with Windows
-        self._startup_var = tk.BooleanVar(value=startup_is_on())
-        r = row(f, "🚀  Launch with Windows")
-        self._toggle(r, self._startup_var, self._do_startup).pack(side="right", padx=12)
-
-        # Break notifications
-        self._notif_var = tk.BooleanVar(value=self.cfg.get("notify_break", True))
-        r = row(f, "🔔  Break notifications")
-        self._toggle(r, self._notif_var, self._save_cfg).pack(side="right", padx=12)
-
-        # Minimize to tray
-        self._tray_var = tk.BooleanVar(value=self.cfg.get("minimize_to_tray", True))
-        r = row(f, "🗕  Minimize to tray on close (instead of quitting)")
-        self._toggle(r, self._tray_var, self._save_cfg).pack(side="right", padx=12)
-
-        # Session password
-        r = row(f, "🔑  Session stop password")
-        has = self.cfg.get("password_hash","")
-        tk.Label(r, text="✓ Set" if has else "Not set",
-                 bg=C["card"], fg=C["success"] if has else C["subtext"],
-                 font=("Segoe UI",9)).pack(side="right", padx=6)
-        tk.Button(r, text="Change", command=lambda: self._change_pw("password_hash"),
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",9), padx=8, pady=3,
-                  cursor="hand2", bd=0).pack(side="right", padx=6)
-
-        # Parent password
-        r = row(f, "👨‍👧  Parent password (overrides session pw)")
-        hasp = self.cfg.get("parent_password_hash","")
-        tk.Label(r, text="✓ Set" if hasp else "Not set",
-                 bg=C["card"], fg=C["success"] if hasp else C["subtext"],
-                 font=("Segoe UI",9)).pack(side="right", padx=6)
-        tk.Button(r, text="Change", command=lambda: self._change_pw("parent_password_hash"),
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",9), padx=8, pady=3,
-                  cursor="hand2", bd=0).pack(side="right", padx=6)
-
-        # About
-        about = tk.Frame(f, bg=C["card"]); about.pack(fill="x", pady=3)
-        tk.Label(about, text=f"FocusLock v{VERSION}  ·  made by zadwen  ·  github.com/zadwen/FocusLock",
-                 bg=C["card"], fg=C["subtext"], font=("Segoe UI",9)).pack(padx=12, pady=10)
-
-        tk.Label(f, text="Coming soon: daily goals, export stats, multiple profiles, Discord status",
-                 bg=C["bg"], fg=C["subtext"], font=("Segoe UI",8,"italic")).pack(anchor="w", pady=(8,0))
-
-    # ── Session logic ─────────────────────────────────────────────────────────
-    def _toggle_session(self):
-        if not self._locked: self._start()
-        else: self._stop()
-
-    def _start(self):
-        C = self.C
-        work, brk = PRESETS.get(self._preset.get(), (25,5))
-        self._timer = PomodoroTimer(work, brk, on_tick=self._tick, on_phase=self._phase_change)
-        self._progress["maximum"] = work * 60
-        self._blocker = AppBlocker(self.cfg["blocklist"])
-        self._blocker.start()
-        if self._web_var.get():
-            if not block_sites(self.cfg["website_blocklist"]):
-                messagebox.showwarning("Admin needed",
-                    "Website blocking needs Administrator.\nRight-click → Run as Administrator.")
-        self._timer.start()
-        self._locked = True
-        self._paused = False
-        self._session_start = datetime.datetime.now()
-        self.cfg["session_name"] = self._sname.get()
-        save_config(self.cfg)
-        self._start_btn.configure(text="🔓  STOP SESSION", bg=C["accent2"])
-        self._pause_btn.configure(state="normal")
-        self._status.configure(text="🔒 Session active. Stay focused!")
-
-    def _stop(self):
-        # password check
-        if self.cfg.get("password_hash") or self.cfg.get("parent_password_hash"):
-            pw = simpledialog.askstring("Unlock", "Enter password to stop:", show="*")
-            if not pw: return
-            h = hash_pw(pw)
-            if h != self.cfg.get("password_hash") and h != self.cfg.get("parent_password_hash"):
-                messagebox.showerror("Wrong password", "Stay focused! 💪")
-                return
-        C = self.C
-        if self._timer:   self._timer.pause()
-        if self._blocker: self._blocker.stop()
-        unblock_sites()
-        self._locked = False
-        self._paused = False
-        self._start_btn.configure(text="🔒  START SESSION", bg=C["accent"])
-        self._pause_btn.configure(state="disabled", text="⏸ Pause")
-        self._status.configure(text="Session ended. Good work!")
-        self._record()
-
-    def _pause_resume(self):
-        if not self._locked or not self._timer: return
-        C = self.C
-        if not self._paused:
-            self._timer.pause()
-            if self._blocker: self._blocker.stop()
-            self._paused = True
-            self._pause_btn.configure(text="▶ Resume")
-            self._status.configure(text="⏸ Paused.")
+    def _list_page(self, name, key):
+        p, C = self.pages[name], self.C
+        if key == "blocklist":
+            note = ("Exact process names. Apps close during focus and are allowed on breaks.\n"
+                    "Save your work first: closing an app can discard unsaved changes.")
         else:
-            self._timer.start()
-            self._blocker = AppBlocker(self.cfg["blocklist"])
-            self._blocker.start()
-            self._paused = False
-            self._pause_btn.configure(text="⏸ Pause")
-            self._status.configure(text="🔒 Back to focus.")
+            note = ("Blocks listed domains and their www versions through the hosts file.\n"
+                    "Other subdomains, VPNs and cached connections may bypass this.")
+        self.text(p, note, 10, "muted", justify="left", wraplength=660).pack(anchor="w", pady=(0, 14))
+        if key == "website_blocklist":
+            self.web_var = tk.BooleanVar(value=self.cfg["block_websites"])
+            self._check(p, "Enable website blocking during focus", self.web_var, self.toggle_web).pack(anchor="w", pady=(0, 8))
+            privilege = ("Run as Administrator to edit hosts. App blocking works without it." if IS_WINDOWS else
+                         "Needs write access to /etc/hosts. See README for the Linux limitation.")
+            self.text(p, privilege, 9, "muted", wraplength=660).pack(anchor="w", pady=(0, 14))
+        box_frame = tk.Frame(p, bg=C["surface"])
+        box_frame.pack(fill="both", expand=True)
+        scroll = tk.Scrollbar(box_frame)
+        scroll.pack(side="right", fill="y")
+        box = tk.Listbox(box_frame, bg=C["surface"], fg=C["text"], selectbackground=C["accent"],
+                         selectforeground=C["ink"], font=(self.font, 12), relief="flat", bd=0,
+                         highlightthickness=0, yscrollcommand=scroll.set, activestyle="none",
+                         selectmode="extended", exportselection=False)
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        scroll.configure(command=box.yview)
+        for item in self.cfg[key]:
+            box.insert("end", item)
+        row = tk.Frame(p, bg=C["bg"])
+        row.pack(fill="x", pady=(14, 0))
+        self.button(row, "+ Add app" if key == "blocklist" else "+ Add website",
+                    lambda: self.add_item(key, box), primary=True).pack(side="left", padx=(0, 8))
+        self.button(row, "Remove selected", lambda: self.remove_items(key, box), danger=True).pack(side="left")
+        self.text(p, "Lists are locked while a session is running. Stop the session to edit.", 9, "muted").pack(anchor="w", pady=12)
 
-    def _reset_timer(self):
-        if self._locked: messagebox.showinfo("Active","Stop the session first."); return
-        if self._timer: self._timer.reset()
-        work, _ = PRESETS.get(self._preset.get(), (25,5))
-        self._timer_lbl.configure(text=f"{work:02d}:00")
-        self._phase_lbl.configure(text="FOCUS TIME")
-        self._progress["value"] = 0
-        self._cycle_lbl.configure(text="No cycles yet")
+    def _insights_page(self):
+        p = self.pages["Insights"]
+        self.text(p, "Only active focus time counts. Breaks and pauses are excluded.", 11, "muted").pack(anchor="w", pady=(0, 22))
+        self.stat_labels = {}
+        grid = tk.Frame(p, bg=self.C["bg"])
+        grid.pack(fill="x")
+        for i, key in enumerate(("Focus time", "Sessions", "Current streak", "Best streak")):
+            grid.columnconfigure(i % 2, weight=1)
+            card = tk.Frame(grid, bg=self.C["surface"])
+            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=(0, 10), pady=(0, 10))
+            self.text(card, key.upper(), 9, "muted", True).pack(anchor="w", padx=20, pady=(20, 10))
+            self.stat_labels[key] = self.text(card, "0", 28, "accent", True)
+            self.stat_labels[key].pack(anchor="w", padx=20, pady=(0, 22))
+        self.text(p, "THIS WEEK · completed sessions", 9, "muted", True).pack(anchor="w", pady=(18, 8))
+        self.week_label = self.text(p, "", 11, justify="left")
+        self.week_label.pack(anchor="w")
+        self.button(p, "Reset saved insights", self.reset_stats, danger=True).pack(anchor="w", pady=24)
 
-    def _apply_preset(self):
-        if self._locked: return
-        work, brk = PRESETS[self._preset.get()]
-        self.cfg["pomodoro_work"] = work
-        self.cfg["pomodoro_break"] = brk
-        save_config(self.cfg)
-        self._timer_lbl.configure(text=f"{work:02d}:00")
-        self._progress["value"] = 0
+    def _check(self, parent, text, variable, command):
+        return tk.Checkbutton(parent, text=text, variable=variable, command=command,
+                              bg=parent.cget("bg"), fg=self.C["text"], activebackground=parent.cget("bg"),
+                              activeforeground=self.C["text"], selectcolor=self.C["card"],
+                              font=(self.font, 11), cursor="hand2", padx=0)
 
-    # ── Timer callbacks ───────────────────────────────────────────────────────
-    def _tick(self, rem, phase):
-        self.after(0, self._draw_timer, rem, phase)
+    def _settings_page(self):
+        p = self.pages["Settings"]
+        self.text(p, "Build a routine that works for you.", 11, "muted").pack(anchor="w", pady=(0, 18))
+        for key, label in (("notify_break", "Notify me when focus or break ends"),
+                           ("minimize_on_close", "Minimize to the taskbar when I close the window")):
+            variable = tk.BooleanVar(value=self.cfg[key])
+            self._check(p, label, variable, lambda k=key, v=variable: self.change_setting(k, v.get())).pack(anchor="w", pady=7)
+        try:
+            enabled = startup_enabled()
+        except OSError:
+            enabled = False
+        self.startup_var = tk.BooleanVar(value=enabled)
+        self._check(p, "Open FocusLock when I sign in", self.startup_var, self.change_startup).pack(anchor="w", pady=7)
+        self.button(p, "Switch to " + ("light" if self.cfg["theme"] == "dark" else "dark") + " theme", self.toggle_theme).pack(anchor="w", pady=18)
+        self.text(p, "SESSION GUARD", 9, "muted", True).pack(anchor="w", pady=(8, 6))
+        self.text(p, "Passwords guard pause, stop and password changes.\nFocusLock is a self-control tool, not parental-control security.",
+                  10, "muted", justify="left").pack(anchor="w", pady=(0, 14))
+        for key, label in (("password_hash", "Session password"), ("parent_password_hash", "Recovery password")):
+            row = tk.Frame(p, bg=self.C["surface"])
+            row.pack(fill="x", pady=5)
+            self.text(row, label + ("  ·  Set" if self.cfg[key] else "  ·  Not set"), 11).pack(side="left", padx=15)
+            self.button(row, "Change", lambda k=key: self.change_password(k)).pack(side="right", padx=6, pady=6)
+        self.text(p, "Stored on this computer only:\n" + str(self.directory), 9, "muted", justify="left", wraplength=640).pack(anchor="w", pady=18)
 
-    def _draw_timer(self, rem, phase):
-        m, s = divmod(rem, 60)
-        self._timer_lbl.configure(text=f"{m:02d}:{s:02d}")
-        total = (self.cfg["pomodoro_work"] if phase=="work" else self.cfg["pomodoro_break"]) * 60
-        self._progress["maximum"] = total
-        self._progress["value"]   = total - rem
+    def set_status(self, text, error=False):
+        self.status_text = text
+        self.status_label.configure(text=text, fg=self.C["danger" if error else "muted"])
 
-    def _phase_change(self, phase, cycles):
-        self.after(0, self._draw_phase, phase, cycles)
+    def idle_edit(self):
+        if self.active:
+            messagebox.showinfo("Session running", "Stop your session before changing its plan or blocklists.", parent=self)
+            return False
+        return True
 
-    def _draw_phase(self, phase, cycles):
-        C = self.C
-        if phase == "work":
-            self._phase_lbl.configure(text="FOCUS TIME", fg=C["accent"])
-            if self._notif_var.get(): notify("FocusLock","Break's over — back to work! 💪")
-        else:
-            self._phase_lbl.configure(text="☕ BREAK TIME", fg=C["success"])
-            if self._notif_var.get(): notify("FocusLock",f"Nice! Take a break. ({cycles} cycles done)")
-        self._cycle_lbl.configure(text=f"{cycles} cycle{'s' if cycles!=1 else ''} done")
-        self.bell()
-
-    # ── List management ───────────────────────────────────────────────────────
-    def _add_app(self):
-        v = simpledialog.askstring("Add app","Enter .exe name (e.g. discord.exe):")
-        if v and v.strip():
-            n = v.strip().lower()
-            if n not in self.cfg["blocklist"]:
-                self.cfg["blocklist"].append(n)
-                self._app_lb.insert(tk.END, n)
-                save_config(self.cfg)
-
-    def _remove_app(self):
-        sel = self._app_lb.curselection()
-        if not sel: return
-        v = self._app_lb.get(sel[0])
-        self._app_lb.delete(sel[0])
-        if v in self.cfg["blocklist"]: self.cfg["blocklist"].remove(v)
-        save_config(self.cfg)
-
-    def _reset_app_defaults(self):
-        if messagebox.askyesno("Reset","Reset blocklist to defaults?"):
-            self.cfg["blocklist"] = DEFAULT_APPS[:]
-            self._app_lb.delete(0, tk.END)
-            for a in self.cfg["blocklist"]: self._app_lb.insert(tk.END, a)
-            save_config(self.cfg)
-
-    def _add_site(self):
-        v = simpledialog.askstring("Add site","Enter domain (e.g. reddit.com):")
-        if v and v.strip():
-            n = v.strip().lower()
-            if n not in self.cfg["website_blocklist"]:
-                self.cfg["website_blocklist"].append(n)
-                self._web_lb.insert(tk.END, n)
-                save_config(self.cfg)
-
-    def _remove_site(self):
-        sel = self._web_lb.curselection()
-        if not sel: return
-        v = self._web_lb.get(sel[0])
-        self._web_lb.delete(sel[0])
-        if v in self.cfg["website_blocklist"]: self.cfg["website_blocklist"].remove(v)
-        save_config(self.cfg)
-
-    # ── Passwords ─────────────────────────────────────────────────────────────
-    def _change_pw(self, key):
-        pw = simpledialog.askstring("Password","New password (blank = disable):", show="*")
-        if pw is None: return
-        self.cfg[key] = hash_pw(pw) if pw else ""
-        save_config(self.cfg)
-        messagebox.showinfo("Saved","Password updated!" if pw else "Password removed.")
-
-    # ── Stats ─────────────────────────────────────────────────────────────────
-    def _record(self):
-        if not self._session_start: return
-        mins = max(1, (datetime.datetime.now()-self._session_start).seconds//60)
-        today = datetime.date.today().isoformat()
-        self.stats["total_sessions"] += 1
-        self.stats["total_minutes"]  += mins
-        self.stats["sessions_by_date"][today] = self.stats["sessions_by_date"].get(today,0)+1
-        last = self.stats.get("last_session_date","")
-        if last:
-            try:
-                diff = (datetime.date.today() - datetime.date.fromisoformat(last)).days
-                if diff == 1:   self.stats["current_streak"] += 1
-                elif diff > 1:  self.stats["current_streak"] = 1
-            except Exception:   self.stats["current_streak"] = 1
-        else: self.stats["current_streak"] = 1
-        self.stats["longest_streak"] = max(self.stats["longest_streak"], self.stats["current_streak"])
-        self.stats["last_session_date"] = today
-        save_stats(self.stats)
-        self._session_start = None
-
-    def _reset_stats(self):
-        if messagebox.askyesno("Reset","Clear all your study stats?"):
-            self.stats = {"total_sessions":0,"total_minutes":0,"sessions_by_date":{},
-                          "current_streak":0,"longest_streak":0,"last_session_date":""}
-            save_stats(self.stats)
-
-    # ── Settings helpers ──────────────────────────────────────────────────────
-    def _do_startup(self):
-        if not set_startup(self._startup_var.get()):
-            messagebox.showwarning("Error","Couldn't update startup. Try running as Admin.")
-        self._save_cfg()
-
-    def _save_cfg(self):
-        self.cfg["block_websites"]   = self._web_var.get()
-        self.cfg["notify_break"]     = self._notif_var.get()
-        self.cfg["minimize_to_tray"] = self._tray_var.get()
-        save_config(self.cfg)
-
-    def _toggle_theme(self):
-        self.cfg["theme"] = "light" if self.cfg["theme"]=="dark" else "dark"
-        save_config(self.cfg)
-        messagebox.showinfo("Theme","Restart FocusLock to apply the new theme.")
-
-    # ── Close / minimize to tray ──────────────────────────────────────────────
-    def _on_close(self):
-        if self._locked:
-            messagebox.showwarning("Locked","Stop the session before closing!")
+    def choose_preset(self, values):
+        if not self.idle_edit():
             return
-        if self._tray_var.get():
-            self._minimize()
+        self.work_var.set(str(values[0]))
+        self.break_var.set(str(values[1]))
+        self.apply_custom()
+
+    def apply_custom(self):
+        if not self.idle_edit():
+            return False
+        try:
+            work, rest = int(self.work_var.get()), int(self.break_var.get())
+            if not 1 <= work <= 240 or not 1 <= rest <= 240:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid duration", "Enter whole minutes between 1 and 240 for both timers.", parent=self)
+            return False
+        self.cfg.update(pomodoro_work=work, pomodoro_break=rest)
+        if not self.persist():
+            return False
+        self._render_timer()
+        return True
+
+    def authorize(self, prompt="Enter your session or recovery password:", recovery_only=False):
+        keys = ("parent_password_hash",) if recovery_only else ("password_hash", "parent_password_hash")
+        stored = [self.cfg[k] for k in keys if self.cfg[k]]
+        if not stored:
+            return True
+        pw = simpledialog.askstring("Session guard", prompt, show="*", parent=self)
+        if pw is None:
+            return False
+        if any(verify_password(pw, value) for value in stored):
+            return True
+        messagebox.showerror("Incorrect password", "The password did not match.", parent=self)
+        return False
+
+    def toggle_session(self):
+        if self.active:
+            self.stop_session()
+            return
+        if not self.apply_custom():
+            return
+        if self.cfg["blocklist"] and not messagebox.askokcancel("Ready to focus?",
+                "Listed apps will be closed during focus. Save any work in those apps before starting.", parent=self):
+            return
+        self.cfg["session_name"] = self.name_var.get().strip()
+        if not self.persist():
+            return
+        self.site_error = False
+        self.session = Session(self.cfg["pomodoro_work"], self.cfg["pomodoro_break"])
+        self.session.start()
+        self._sync_blocking()
+        self.set_status("Session started. Give this task your attention." + (" Website blocking is unavailable." if self.site_error else ""), self.site_error)
+        self._render_timer()
+
+    def _sync_blocking(self):
+        focusing = self.active and not self.session.paused and self.session.phase == "work"
+        self.blocker.configure(self.cfg["blocklist"], focusing)
+        should_block = focusing and self.cfg["block_websites"] and not self.site_error
+        try:
+            if should_block and not self.hosts.active:
+                self.hosts.update(self.cfg["website_blocklist"])
+            elif not should_block and self.hosts.active:
+                self.hosts.update()
+        except (OSError, ValueError) as exc:
+            self.site_error = True
+            self.set_status("Website blocker needs attention. " + str(exc), True)
+            messagebox.showwarning("Website blocker", f"{exc}\n\nApp blocking still works. To recover leftover rules, use the README recovery instructions.", parent=self)
+
+    def pause_resume(self):
+        if not self.active:
+            return
+        if self.session.paused:
+            self.session.resume()
+            self.set_status("Welcome back. Continue at your own pace.")
         else:
-            self._quit()
+            if not self.authorize():
+                return
+            self.session.pause()
+            self.set_status("Paused. Apps and websites are allowed until you resume.")
+        self._sync_blocking()
+        self._render_timer()
 
-    def _minimize(self):
-        """Hide main window and show a small always-on-top restore bar."""
-        self.withdraw()
-        if self._mini_win and self._mini_win.winfo_exists():
-            return  # already showing
+    def stop_session(self):
+        if not self.active or not self.authorize():
+            return False
+        self.session.stop()
+        self._sync_blocking()
+        record_session(self.stats, self.session.focus_seconds)
+        self.persist(stats=True)
+        seconds = int(self.session.focus_seconds)
+        self.set_status(f"Session saved · {seconds // 60}m {seconds % 60}s of focus." + (" Website rules remain; recovery is needed." if self.hosts.active else " Well done."), self.hosts.active)
+        self._render_timer()
+        return True
 
-        C = self.C
-        w = tk.Toplevel(self)
-        w.overrideredirect(True)        # no title bar / borders
-        w.attributes("-topmost", True)  # always on top
-        w.attributes("-alpha", 0.95)
-        w.configure(bg=C["accent"])
+    def _pulse(self):
+        if self._closing:
+            return
+        if self.active:
+            changed = self.session.advance()
+            if changed:
+                self._sync_blocking()
+                message = "Take a breath. It's break time." if self.session.phase == "break" else "Break's over. Ready to focus?"
+                self.set_status(message, self.site_error)
+                if self.cfg["notify_break"]:
+                    notify("FocusLock", message)
+                    self.bell()
+        try:
+            while True:
+                self.set_status(self.blocker.errors.get_nowait(), True)
+        except queue.Empty:
+            pass
+        self._render_timer()
+        self.after(200, self._pulse)
 
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        w.geometry(f"180x38+{sw-194}+{sh-70}")
+    def _render_timer(self):
+        active = self.active
+        phase = self.session.phase if active else "work"
+        paused = active and self.session.paused
+        duration = self.cfg["pomodoro_work"] * 60
+        self.timer_label.configure(text=self.session.display if active else f"{self.cfg['pomodoro_work']:02d}:00")
+        self.phase_label.configure(text="ON PAUSE" if paused else "FOCUS TIME" if phase == "work" else "TAKE A BREAK")
+        if active:
+            duration = self.session.work_seconds if phase == "work" else self.session.break_seconds
+            self.progress["value"] = 100 * (1 - self.session.remaining / duration)
+            self.cycle_label.configure(text=f"{self.session.cycles} completed cycles · {int(self.session.focus_seconds) // 60} min focused")
+        else:
+            self.progress["value"] = 0
+            self.cycle_label.configure(text="No rush. Just begin.")
+        self.state_badge.configure(text="PAUSED" if paused else "FOCUSING" if active and phase == "work" else "ON BREAK" if active else "READY")
+        self.start_button.configure(text="End session" if active else "Start focus")
+        self.pause_button.configure(state="normal" if active else "disabled", text="Resume" if paused else "Pause")
+        for button in self.preset_buttons + [self.apply_button]:
+            button.configure(state="disabled" if active else "normal")
+        self.name_entry.configure(state="disabled" if active else "normal")
+        self.block_summary.configure(text=f"{len(self.cfg['blocklist'])} apps on your list  ·  Website blocking {'unavailable' if self.site_error else 'on' if self.cfg['block_websites'] else 'off'}")
+        if self.current_page == "Insights":
+            self._refresh_stats()
 
-        def restore():
-            self._mini_win = None
-            w.destroy()
-            self.deiconify()
-            self.lift()
+    def add_item(self, key, box):
+        if not self.idle_edit():
+            return
+        prompt = ("Exact process name (e.g. discord.exe):" if IS_WINDOWS else "Exact process name (e.g. Discord or steam):") if key == "blocklist" else "Domain or URL (e.g. reddit.com):"
+        raw = simpledialog.askstring("Add app" if key == "blocklist" else "Add website", prompt, parent=self)
+        if raw is None:
+            return
+        try:
+            value = validate_app(raw) if key == "blocklist" else normalize_domain(raw)
+        except ValueError as exc:
+            messagebox.showerror("Invalid entry", str(exc), parent=self)
+            return
+        if value.casefold() in [v.casefold() for v in self.cfg[key]]:
+            self.set_status("That item is already on your list.")
+            return
+        self.cfg[key].append(value)
+        box.insert("end", value)
+        self.persist()
+        self._render_timer()
 
-        def quit_app():
-            self._mini_win = None
-            w.destroy()
-            self._quit()
+    def remove_items(self, key, box):
+        if not self.idle_edit():
+            return
+        for index in reversed(box.curselection()):
+            self.cfg[key].pop(index)
+            box.delete(index)
+        self.persist()
+        self._render_timer()
 
-        tk.Button(w, text="🔒 FocusLock", command=restore,
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",9,"bold"), cursor="hand2", bd=0
-                  ).pack(side="left", padx=10, pady=6)
-        tk.Button(w, text="✕", command=quit_app,
-                  bg=C["accent"], fg="white", relief="flat",
-                  font=("Segoe UI",10,"bold"), cursor="hand2", bd=0
-                  ).pack(side="right", padx=8)
+    def toggle_web(self):
+        if not self.idle_edit():
+            self.web_var.set(self.cfg["block_websites"])
+            return
+        self.cfg["block_websites"] = self.web_var.get()
+        self.persist()
+        self._render_timer()
 
-        self._mini_win = w
+    def change_password(self, key):
+        if not self.idle_edit():
+            return
+        if not self.authorize(recovery_only=key == "parent_password_hash" and bool(self.cfg[key])):
+            return
+        password = simpledialog.askstring("Change password", "New password (leave empty to remove):", show="*", parent=self)
+        if password is None:
+            return
+        if password:
+            confirm = simpledialog.askstring("Confirm password", "Enter the new password again:", show="*", parent=self)
+            if password != confirm:
+                messagebox.showerror("Passwords differ", "Nothing was changed. Try again.", parent=self)
+                return
+        self.cfg[key] = hash_password(password) if password else ""
+        self.persist()
+        self._build()
 
-    def _quit(self):
-        if self._blocker: self._blocker.stop()
-        unblock_sites()
+    def change_setting(self, key, value):
+        self.cfg[key] = value
+        self.persist()
+
+    def change_startup(self):
+        try:
+            set_startup(self.startup_var.get())
+        except OSError as exc:
+            self.startup_var.set(not self.startup_var.get())
+            messagebox.showerror("Could not update startup", str(exc), parent=self)
+
+    def toggle_theme(self):
+        self.cfg["session_name"] = self.name_var.get()
+        self.cfg["theme"] = "light" if self.cfg["theme"] == "dark" else "dark"
+        self.persist()
+        self._build()
+
+    def _refresh_stats(self):
+        seconds = int(self.stats["total_seconds"])
+        current, best = streaks(self.stats)
+        values = {"Focus time": f"{seconds // 3600}h {seconds % 3600 // 60}m",
+                  "Sessions": str(int(self.stats["total_sessions"])), "Current streak": f"{current} days", "Best streak": f"{best} days"}
+        for key, value in values.items():
+            self.stat_labels[key].configure(text=value)
+        today = dt.date.today()
+        self.week_label.configure(text="   ·   ".join(f"{(today - dt.timedelta(days=i)).strftime('%a')} {self.stats['sessions_by_date'].get((today - dt.timedelta(days=i)).isoformat(), 0)}" for i in range(6, -1, -1)))
+
+    def reset_stats(self):
+        if self.idle_edit() and messagebox.askyesno("Reset insights", "Permanently clear your saved focus statistics?", parent=self):
+            self.stats = {"total_sessions": 0, "total_seconds": 0, "sessions_by_date": {}}
+            self.persist(stats=True)
+            self._refresh_stats()
+
+    def _recover_hosts(self):
+        try:
+            if self.hosts.has_block():
+                self.hosts.active = True
+                if messagebox.askyesno("Recover website access", "Found website rules from a previous session. Remove them now?", parent=self):
+                    self.hosts.update()
+                else:
+                    self.set_status("Previous website rules remain. Use README recovery instructions to remove them.", True)
+        except (OSError, ValueError) as exc:
+            self.set_status("Could not inspect or recover website rules: " + str(exc), True)
+
+    def close_window(self):
+        if self.cfg["minimize_on_close"]:
+            self.iconify()
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        if self.active and not self.stop_session():
+            return
+        if self.hosts.active:
+            try:
+                self.hosts.update()
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Website rules remain", f"{exc}\nRecover hosts using the README before quitting.", parent=self)
+                return
+        if not self.persist(stats=True):
+            return
+        self._closing = True
+        self.blocker.close()
         self.destroy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="FocusLock for Windows and Linux")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--recover-hosts", action="store_true", help="Remove only FocusLock website rules; requires hosts write permission")
+    args = parser.parse_args()
+    if args.recover_hosts:
+        try:
+            HostsManager().update()
+            print("FocusLock website rules removed.")
+            return 0
+        except (OSError, ValueError) as exc:
+            print(f"Recovery failed: {exc}", file=sys.stderr)
+            return 1
+    if sys.platform not in ("win32", "linux"):
+        print("FocusLock currently supports Windows and Linux.", file=sys.stderr)
+        return 1
+    try:
+        lock = InstanceLock(data_dir())
+    except (OSError, RuntimeError) as exc:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("FocusLock", str(exc), parent=root)
+        root.destroy()
+        return 1
+    try:
+        app = FocusLock()
+        app.mainloop()
+    finally:
+        lock.close()
+    return 0
+
+
 if __name__ == "__main__":
-    app = FocusLock()
-    app.mainloop()
+    raise SystemExit(main())
