@@ -1,9 +1,3 @@
-# FocusLock v1.1.0 - Requirements
-# Core app runs on standard library only (Python 3.10+)
-
-# Optional - for system tray icon support
-pystray>=0.19.0
-Pillow>=10.0.0
-
-# Optional - for building a standalone .exe
-pyinstaller>=6.0
+# Runtime: Python 3.10+ with tkinter/Tk. No pip packages required.
+# Linux distributions package tkinter separately (e.g. python3-tk on Ubuntu).
+# Build dependencies are in requirements-build.txt.
